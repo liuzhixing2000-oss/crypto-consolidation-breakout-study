@@ -25,21 +25,20 @@ DURATION_BUCKETS = [
     (120, 192, "5-8d"),
     (192, 336, "8-14d"),
 ]
-WINDOWS = [20, 24, 30, 36, 48, 60, 72, 96, 120, 144, 168, 192, 240, 288, 336]
+WINDOWS = [20, 24, 30, 36, 48]
 HORIZONS_H = [3, 6, 12, 24]
 
 
 @dataclass(frozen=True)
 class StopSpec:
     name: str
-    range_fraction: float | None = None
-    atr_multiple: float | None = None
+    risk_pct: float
 
 
 STOP_SPECS = [
-    StopSpec("half_range", range_fraction=0.50),
-    StopSpec("full_range", range_fraction=1.00),
-    StopSpec("atr_1_5", atr_multiple=1.50),
+    StopSpec("fixed_1pct", 0.010),
+    StopSpec("fixed_1_5pct", 0.015),
+    StopSpec("fixed_2pct", 0.020),
 ]
 
 
@@ -122,7 +121,7 @@ def detect_events(h1: pd.DataFrame, symbol: str) -> list[dict]:
     d = h1.copy()
     d["atr"] = atr(d)
     d["atr_pct"] = d.atr / d.close
-    events: list[dict] = []
+    candidates: list[dict] = []
     last_event: dict[tuple[int, str], pd.Timestamp] = {}
     for w in WINDOWS:
         shifted = d.shift(1)
@@ -146,7 +145,7 @@ def detect_events(h1: pd.DataFrame, symbol: str) -> list[dict]:
                 if key in last_event and ts - last_event[key] < pd.Timedelta(hours=max(12, w // 2)):
                     continue
                 row = d.loc[ts]
-                events.append({
+                candidates.append({
                     "symbol": symbol, "breakout_time": ts, "side": side,
                     "duration_h": w, "duration_bucket": bucket_for(w),
                     "entry": float(row.close), "upper": float(upper.loc[ts]),
@@ -155,43 +154,80 @@ def detect_events(h1: pd.DataFrame, symbol: str) -> list[dict]:
                     "efficiency": float(efficiency.loc[ts]),
                 })
                 last_event[key] = ts
+    # One market break can satisfy several nested windows. Assign it only to
+    # the longest valid window, then suppress same-direction repeats for 12h.
+    if not candidates:
+        return []
+    unique: dict[tuple[pd.Timestamp, str], dict] = {}
+    for event in candidates:
+        key = (event["breakout_time"], event["side"])
+        if key not in unique or event["duration_h"] > unique[key]["duration_h"]:
+            unique[key] = event
+    events: list[dict] = []
+    last_kept: dict[str, pd.Timestamp] = {}
+    for event in sorted(unique.values(), key=lambda x: x["breakout_time"]):
+        side = event["side"]
+        if side in last_kept and event["breakout_time"] - last_kept[side] < pd.Timedelta(hours=12):
+            continue
+        events.append(event)
+        last_kept[side] = event["breakout_time"]
     return events
+
+
+def evaluate_route(event: dict, future: pd.DataFrame, entry_time: pd.Timestamp,
+                   entry: float, route: str, fee_bps_roundtrip: float) -> list[dict]:
+    sign = 1 if event["side"] == "LONG" else -1
+    out: list[dict] = []
+    for spec in STOP_SPECS:
+        risk = entry * spec.risk_pct
+        stop = entry - sign * risk
+        fee_r = (fee_bps_roundtrip / 10000.0 * entry) / risk
+        base = {**event, "entry_route": route, "entry_time": entry_time,
+                "route_entry": entry, "stop_method": spec.name, "stop_price": stop,
+                "risk_abs": risk, "risk_pct": spec.risk_pct, "fee_r": fee_r}
+        for horizon in HORIZONS_H:
+            p = future.loc[(future.index > entry_time) &
+                           (future.index <= entry_time + pd.Timedelta(hours=horizon))]
+            if p.empty:
+                continue
+            favorable = ((p.high-entry) if sign == 1 else (entry-p.low)) / risk
+            adverse = ((entry-p.low) if sign == 1 else (p.high-entry)) / risk
+            stop_mask = adverse >= 1.0
+            first_stop = int(np.argmax(stop_mask.to_numpy())) if stop_mask.any() else len(p)
+            # Conservative intrabar rule: if stop and target occur in the same
+            # 15m bar, count the stop first and exclude that bar from MFE/targets.
+            before_stop = favorable.iloc[:first_stop]
+            mfe = float(before_stop.max()) if len(before_stop) else 0.0
+            mae = float(min(1.0, adverse.iloc[:first_stop+1].max()))
+            stopped = bool(stop_mask.any())
+            terminal = -1.0 if stopped else sign * (p.close.iloc[-1]-entry) / risk
+            rec = dict(base)
+            rec.update({"horizon_h": horizon, "mfe_r": mfe, "mae_r": mae,
+                        "hit_1r": mfe >= 1, "hit_2r": mfe >= 2, "hit_3r": mfe >= 3,
+                        "stopped": stopped, "terminal_r": float(terminal-fee_r)})
+            out.append(rec)
+    return out
 
 
 def evaluate_event(event: dict, m15: pd.DataFrame, fee_bps_roundtrip: float) -> list[dict]:
     start = event["breakout_time"] + pd.Timedelta(hours=1)
-    path = m15.loc[(m15.index >= start) & (m15.index < start + pd.Timedelta(hours=max(HORIZONS_H)))]
-    if len(path) < 8:
+    future = m15.loc[(m15.index >= start) &
+                     (m15.index <= start + pd.Timedelta(hours=36))]
+    if len(future) < 8:
         return []
-    sign = 1 if event["side"] == "LONG" else -1
-    entry = event["entry"]
-    out: list[dict] = []
-    for spec in STOP_SPECS:
-        risk = (event["range_size"] * spec.range_fraction if spec.range_fraction is not None
-                else event["atr_1h"] * spec.atr_multiple)
-        if not np.isfinite(risk) or risk <= 0:
-            continue
-        stop = entry - sign * risk
-        fee_r = (fee_bps_roundtrip / 10000.0 * entry) / risk
-        base = {**event, "stop_method": spec.name, "stop_price": stop,
-                "risk_abs": risk, "risk_pct": risk / entry, "fee_r": fee_r}
-        for horizon in HORIZONS_H:
-            p = path.loc[path.index < start + pd.Timedelta(hours=horizon)]
-            favorable = ((p.high-entry) if sign == 1 else (entry-p.low)) / risk
-            adverse = ((entry-p.low) if sign == 1 else (p.high-entry)) / risk
-            stopped = adverse >= 1.0
-            first_stop_pos = int(np.argmax(stopped.to_numpy())) if stopped.any() else len(p)
-            rec = dict(base)
-            rec.update({
-                "horizon_h": horizon,
-                "mfe_r": float(favorable.max()), "mae_r": float(adverse.max()),
-                "hit_1r": bool((favorable.iloc[:first_stop_pos+1] >= 1).any()),
-                "hit_2r": bool((favorable.iloc[:first_stop_pos+1] >= 2).any()),
-                "hit_3r": bool((favorable.iloc[:first_stop_pos+1] >= 3).any()),
-                "stopped": bool(stopped.any()),
-                "terminal_r": float(max(-1.0, sign * (p.close.iloc[-1]-entry) / risk) - fee_r),
-            })
-            out.append(rec)
+    out = evaluate_route(event, future, start-pd.Timedelta(minutes=15),
+                         event["entry"], "DIRECT", fee_bps_roundtrip)
+    # Retest: within 12h price touches the broken boundary and the 15m candle
+    # closes back on the breakout side. Enter at that confirmation close.
+    test = future.loc[future.index < start + pd.Timedelta(hours=12)]
+    if event["side"] == "LONG":
+        mask = (test.low <= event["upper"] + 0.10*event["atr_1h"]) & (test.close >= event["upper"])
+    else:
+        mask = (test.high >= event["lower"] - 0.10*event["atr_1h"]) & (test.close <= event["lower"])
+    if mask.any():
+        entry_time = test.index[int(np.argmax(mask.to_numpy()))]
+        out += evaluate_route(event, future, entry_time, float(test.loc[entry_time, "close"]),
+                              "RETEST", fee_bps_roundtrip)
     return out
 
 
@@ -216,10 +252,11 @@ def report(duration: pd.DataFrame, symbols: list[str], args: argparse.Namespace)
     if duration.empty:
         lines += ["未产生合格事件。请检查数据下载或适当放宽横盘条件。"]
     else:
-        core = duration[(duration.horizon_h == 24) & (duration.stop_method == "half_range")]
-        lines += ["## 24小时、半区间止损摘要", "", "```csv", core.to_csv(index=False).strip(), "```", ""]
+        core = duration[duration.horizon_h == 24]
+        lines += ["## 24小时结果：直接突破 vs 回踩确认", "", "```csv",
+                  core.to_csv(index=False).strip(), "```", ""]
     lines += ["## 判读原则", "", "- 至少保留100个独立事件后再比较时长组。",
-              "- 优先看样本外的平均终值R、2R到达率、止损率和中位风险百分比。",
+              "- 优先看OOS的平均终值R、2R到达率、止损率和中位结果。",
               "- 若更长横盘只有绝对MFE上升、但MFE/R和净R没有改善，则不支持延长扫描门槛。"]
     return "\n".join(lines)
 
@@ -258,9 +295,13 @@ def main() -> None:
         for ev in detect_events(frames["1h"], symbol):
             all_rows.extend(evaluate_event(ev, frames["15m"], args.fee_bps_roundtrip))
     events = pd.DataFrame(all_rows)
+    if not events.empty:
+        events["breakout_time"] = pd.to_datetime(events["breakout_time"], utc=True)
+        cutoff = start + (end-start) * 0.70
+        events["sample_period"] = np.where(events.breakout_time <= cutoff, "IS", "OOS")
     events.to_csv(output / "events.csv", index=False)
-    duration = summarise(events, ["duration_bucket", "duration_h", "stop_method", "horizon_h"])
-    stops = summarise(events, ["stop_method", "horizon_h"])
+    duration = summarise(events, ["sample_period", "duration_h", "entry_route", "stop_method", "horizon_h"])
+    stops = summarise(events, ["sample_period", "entry_route", "stop_method", "horizon_h"])
     duration.to_csv(output / "duration_summary.csv", index=False)
     stops.to_csv(output / "stop_summary.csv", index=False)
     report_text = report(duration, symbols, args)
