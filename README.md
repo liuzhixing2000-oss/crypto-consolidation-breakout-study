@@ -31,6 +31,7 @@ python breakout_study.py --symbol-list BTCUSDT,ETHUSDT,SOLUSDT --history-days 36
 - `events.csv`：每个突破事件和各止损方案的逐笔路径。
 - `duration_summary.csv`：按横盘时长分组的风险调整结果。
 - `stop_summary.csv`：不同止损逻辑的比较。
+- `feature_summary.csv`：48小时直接突破基线的压缩、突破质量与4H环境分箱。
 - `validation_report.md`：自动生成的中文摘要。
 
 第一轮研究的目标不是直接选出交易参数，而是判断36–72小时、3–5天等时长组是否在样本外仍有更好的R期望。
