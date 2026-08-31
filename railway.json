@@ -1,0 +1,8 @@
+{
+  "$schema": "https://railway.com/railway.schema.json",
+  "build": {"builder": "NIXPACKS"},
+  "deploy": {
+    "startCommand": "python breakout_study.py --symbols 50 --history-days 730 --output results --cache data",
+    "restartPolicyType": "NEVER"
+  }
+}
