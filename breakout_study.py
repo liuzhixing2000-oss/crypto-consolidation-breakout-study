@@ -263,9 +263,12 @@ def main() -> None:
     stops = summarise(events, ["stop_method", "horizon_h"])
     duration.to_csv(output / "duration_summary.csv", index=False)
     stops.to_csv(output / "stop_summary.csv", index=False)
-    (output / "validation_report.md").write_text(report(duration, symbols, args), encoding="utf-8")
+    report_text = report(duration, symbols, args)
+    (output / "validation_report.md").write_text(report_text, encoding="utf-8")
     (output / "run_config.json").write_text(json.dumps(vars(args) | {"symbols_used": symbols}, indent=2), encoding="utf-8")
     print(f"Done: {len(events):,} evaluated paths -> {output}")
+    print("\n===== VALIDATION REPORT =====\n")
+    print(report_text)
 
 
 if __name__ == "__main__":
