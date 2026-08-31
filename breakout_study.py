@@ -109,6 +109,36 @@ def atr(df: pd.DataFrame, n: int = 14) -> pd.Series:
     return tr.rolling(n, min_periods=n).mean()
 
 
+def add_context_features(d: pd.DataFrame) -> pd.DataFrame:
+    """Add features observable when each 1H candle closes; no future bars used."""
+    d = d.copy()
+    d["atr"] = atr(d)
+    d["atr_pct"] = d.atr / d.close
+    prior_close = d.close.shift(1)
+    bb_mid = prior_close.rolling(20).mean()
+    bb_std = prior_close.rolling(20).std()
+    d["bb_width"] = (4.0 * bb_std) / bb_mid
+    d["atr_compression"] = d.atr_pct / d.atr_pct.shift(1).rolling(720, min_periods=240).median()
+    d["bb_compression"] = d.bb_width / d.bb_width.shift(1).rolling(720, min_periods=240).median()
+    d["compression_slope"] = (
+        d.atr.shift(1).rolling(12).mean() /
+        d.atr.shift(13).rolling(24).mean()
+    )
+
+    # Resample first, then shift one complete 4H bucket to prevent using the
+    # still-forming higher-timeframe candle.
+    h4 = d[["open", "high", "low", "close", "volume"]].resample("4h").agg({
+        "open": "first", "high": "max", "low": "min", "close": "last", "volume": "sum"
+    }).dropna()
+    h4["ema20"] = h4.close.ewm(span=20, adjust=False).mean()
+    h4["ema50"] = h4.close.ewm(span=50, adjust=False).mean()
+    h4["trend_sign"] = np.sign(h4.ema20-h4.ema50).shift(1)
+    h4["trend_strength"] = ((h4.ema20-h4.ema50).abs()/h4.close).shift(1)
+    d["h4_trend_sign"] = h4.trend_sign.reindex(d.index, method="ffill")
+    d["h4_trend_strength"] = h4.trend_strength.reindex(d.index, method="ffill")
+    return d
+
+
 def bucket_for(hours: int) -> str:
     for lo, hi, label in DURATION_BUCKETS:
         if lo <= hours < hi or (label == "8-14d" and hours <= hi):
@@ -118,9 +148,7 @@ def bucket_for(hours: int) -> str:
 
 def detect_events(h1: pd.DataFrame, symbol: str) -> list[dict]:
     """Detect close-confirmed breakouts using only data known at that close."""
-    d = h1.copy()
-    d["atr"] = atr(d)
-    d["atr_pct"] = d.atr / d.close
+    d = add_context_features(h1)
     candidates: list[dict] = []
     last_event: dict[tuple[int, str], pd.Timestamp] = {}
     for w in WINDOWS:
@@ -145,6 +173,10 @@ def detect_events(h1: pd.DataFrame, symbol: str) -> list[dict]:
                 if key in last_event and ts - last_event[key] < pd.Timedelta(hours=max(12, w // 2)):
                     continue
                 row = d.loc[ts]
+                candle_range = max(float(row.high-row.low), 1e-12)
+                direction = 1 if side == "LONG" else -1
+                boundary = float(upper.loc[ts] if side == "LONG" else lower.loc[ts])
+                breakout_distance = direction * (float(row.close)-boundary)
                 candidates.append({
                     "symbol": symbol, "breakout_time": ts, "side": side,
                     "duration_h": w, "duration_bucket": bucket_for(w),
@@ -152,6 +184,16 @@ def detect_events(h1: pd.DataFrame, symbol: str) -> list[dict]:
                     "lower": float(lower.loc[ts]), "range_size": float(range_size.loc[ts]),
                     "range_pct": float(width_pct.loc[ts]), "atr_1h": float(row.atr),
                     "efficiency": float(efficiency.loc[ts]),
+                    "atr_compression": float(row.atr_compression),
+                    "bb_compression": float(row.bb_compression),
+                    "compression_slope": float(row.compression_slope),
+                    "volume_ratio": float(row.volume / d.volume.shift(1).rolling(48).median().loc[ts]),
+                    "body_atr": float(abs(row.close-row.open) / row.atr),
+                    "close_location": float((row.close-row.low)/candle_range if side == "LONG"
+                                            else (row.high-row.close)/candle_range),
+                    "breakout_atr": float(breakout_distance / row.atr),
+                    "h4_aligned": bool(row.h4_trend_sign == direction),
+                    "h4_trend_strength": float(row.h4_trend_strength),
                 })
                 last_event[key] = ts
     # One market break can satisfy several nested windows. Assign it only to
@@ -234,7 +276,7 @@ def evaluate_event(event: dict, m15: pd.DataFrame, fee_bps_roundtrip: float) -> 
 def summarise(events: pd.DataFrame, group_cols: list[str]) -> pd.DataFrame:
     if events.empty:
         return pd.DataFrame()
-    g = events.groupby(group_cols, dropna=False)
+    g = events.groupby(group_cols, dropna=False, observed=True)
     return g.agg(
         samples=("symbol", "size"), symbols=("symbol", "nunique"),
         median_risk_pct=("risk_pct", "median"), median_mfe_r=("mfe_r", "median"),
@@ -245,7 +287,42 @@ def summarise(events: pd.DataFrame, group_cols: list[str]) -> pd.DataFrame:
     ).reset_index()
 
 
-def report(duration: pd.DataFrame, symbols: list[str], args: argparse.Namespace) -> str:
+FEATURES = ["atr_compression", "bb_compression", "compression_slope",
+            "volume_ratio", "body_atr", "close_location", "breakout_atr",
+            "h4_trend_strength"]
+
+
+def feature_study(events: pd.DataFrame) -> pd.DataFrame:
+    """IS-defined quintiles, applied unchanged to OOS for the 48h baseline."""
+    if events.empty:
+        return pd.DataFrame()
+    base = events[(events.duration_h == 48) & (events.entry_route == "DIRECT") &
+                  (events.stop_method == "fixed_2pct") & (events.horizon_h == 24)].copy()
+    rows: list[pd.DataFrame] = []
+    for feature in FEATURES:
+        train = pd.to_numeric(base.loc[base.sample_period == "IS", feature], errors="coerce").dropna()
+        if train.nunique() < 5:
+            continue
+        edges = np.unique(train.quantile([0, .2, .4, .6, .8, 1]).to_numpy())
+        if len(edges) < 3:
+            continue
+        edges[0], edges[-1] = -np.inf, np.inf
+        labels = [f"Q{i+1}" for i in range(len(edges)-1)]
+        binned = pd.cut(pd.to_numeric(base[feature], errors="coerce"), edges,
+                        labels=labels, include_lowest=True)
+        temp = base.assign(feature=feature, feature_bin=binned)
+        s = summarise(temp.dropna(subset=["feature_bin"]),
+                      ["feature", "feature_bin", "sample_period"])
+        rows.append(s)
+    aligned = summarise(base.assign(feature="h4_aligned",
+                                     feature_bin=base.h4_aligned.astype(str)),
+                        ["feature", "feature_bin", "sample_period"])
+    rows.append(aligned)
+    return pd.concat(rows, ignore_index=True) if rows else pd.DataFrame()
+
+
+def report(duration: pd.DataFrame, features: pd.DataFrame,
+           symbols: list[str], args: argparse.Namespace) -> str:
     lines = ["# 横盘—突破时长研究", "", f"标的数：{len(symbols)}；历史长度：{args.history_days}天。",
              f"往返成本假设：{args.fee_bps_roundtrip:.1f} bps。", "",
              "所有结果均以实际结构止损距离归一化为R；绝对涨跌幅不会直接被当成优势。", ""]
@@ -255,6 +332,9 @@ def report(duration: pd.DataFrame, symbols: list[str], args: argparse.Namespace)
         core = duration[duration.horizon_h == 24]
         lines += ["## 24小时结果：直接突破 vs 回踩确认", "", "```csv",
                   core.to_csv(index=False).strip(), "```", ""]
+    if not features.empty:
+        lines += ["## 48小时直接突破、2%止损：质量特征分箱", "", "Q1–Q5边界只用IS计算，随后原样应用于OOS。", "",
+                  "```csv", features.to_csv(index=False).strip(), "```", ""]
     lines += ["## 判读原则", "", "- 至少保留100个独立事件后再比较时长组。",
               "- 优先看OOS的平均终值R、2R到达率、止损率和中位结果。",
               "- 若更长横盘只有绝对MFE上升、但MFE/R和净R没有改善，则不支持延长扫描门槛。"]
@@ -302,9 +382,11 @@ def main() -> None:
     events.to_csv(output / "events.csv", index=False)
     duration = summarise(events, ["sample_period", "duration_h", "entry_route", "stop_method", "horizon_h"])
     stops = summarise(events, ["sample_period", "entry_route", "stop_method", "horizon_h"])
+    features = feature_study(events)
     duration.to_csv(output / "duration_summary.csv", index=False)
     stops.to_csv(output / "stop_summary.csv", index=False)
-    report_text = report(duration, symbols, args)
+    features.to_csv(output / "feature_summary.csv", index=False)
+    report_text = report(duration, features, symbols, args)
     (output / "validation_report.md").write_text(report_text, encoding="utf-8")
     (output / "run_config.json").write_text(json.dumps(vars(args) | {"symbols_used": symbols}, indent=2), encoding="utf-8")
     print(f"Done: {len(events):,} evaluated paths -> {output}")
