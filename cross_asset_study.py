@@ -20,7 +20,10 @@ HORIZONS = [6, 12, 24, 48]
 COST_BPS = 20.0
 ASSETS = {
     "CRYPTO": {"BTCUSDT": "binance", "ETHUSDT": "binance"},
-    "METALS": {"GC=F": "yahoo", "SI=F": "yahoo"},
+    "PRECIOUS_METALS": {"GC=F": "yahoo", "SI=F": "yahoo"},
+    "INDUSTRIAL_METALS": {"HG=F": "yahoo"},
+    "ENERGY": {"CL=F": "yahoo", "NG=F": "yahoo"},
+    "EQUITY_INDICES": {"ES=F": "yahoo", "NQ=F": "yahoo"},
     "EQUITIES": {
         "TSLA": "yahoo", "NVDA": "yahoo", "AMD": "yahoo",
         "AAPL": "yahoo", "META": "yahoo", "AMZN": "yahoo",
@@ -293,7 +296,7 @@ def main() -> None:
     validation.to_csv(output/"walk_forward_validation.csv", index=False)
     thresholds.to_csv(output/"walk_forward_thresholds.csv", index=False)
     stress.to_csv(output/"candidate_robustness.csv", index=False)
-    report = ["# LIQUID CROSS-ASSET VALIDATION", "",
+    report = ["# LIQUID FUTURES AND CROSS-ASSET VALIDATION", "",
               "## Confirmation routes: 48h / 2% stop / 24 trading-hour hold, rolling OOS", "", "```csv",
               validation.to_csv(index=False).strip(), "```", "",
               "## Frozen VOLUME_COMPRESSION robustness", "", "```csv",
