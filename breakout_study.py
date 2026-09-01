@@ -610,4 +610,9 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    # Railway may retain a dashboard-level legacy start command that points to
+    # this file. The active study is now the liquid cross-asset validation;
+    # forward the legacy entry point so cached service settings cannot rerun
+    # the obsolete 100-coin scan.
+    from cross_asset_study import main as cross_asset_main
+    cross_asset_main()
