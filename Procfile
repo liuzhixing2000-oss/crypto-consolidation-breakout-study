@@ -1,1 +1,1 @@
-worker: python precious_frozen_replication.py
+worker: python precious_long_context_execution.py
