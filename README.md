@@ -64,3 +64,5 @@ python breakout_study.py --symbols 100 --history-days 730 --min-history-days 365
 - 亚洲、伦敦、纽约时段拆分，以及2–20 bps成本压力测试。
 
 免费Yahoo 15分钟期货数据通常只有约60天，因此这一轮明确标记为探索性试验；任何候选参数都必须在更长的独立15分钟数据上再次验证。
+
+Railway 当前默认执行该贵金属15分钟多周期试验。
