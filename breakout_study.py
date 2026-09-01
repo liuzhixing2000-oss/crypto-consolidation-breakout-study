@@ -146,7 +146,7 @@ def bucket_for(hours: int) -> str:
     return "other"
 
 
-def detect_events(h1: pd.DataFrame, symbol: str) -> list[dict]:
+def detect_events(h1: pd.DataFrame, symbol: str, symbol_rank: int = 0) -> list[dict]:
     """Detect close-confirmed breakouts using only data known at that close."""
     d = add_context_features(h1)
     candidates: list[dict] = []
@@ -178,7 +178,9 @@ def detect_events(h1: pd.DataFrame, symbol: str) -> list[dict]:
                 boundary = float(upper.loc[ts] if side == "LONG" else lower.loc[ts])
                 breakout_distance = direction * (float(row.close)-boundary)
                 candidates.append({
-                    "symbol": symbol, "breakout_time": ts, "side": side,
+                    "symbol": symbol, "symbol_rank": symbol_rank,
+                    "universe": "CORE_1_50" if symbol_rank <= 50 else "EXTERNAL_51_100",
+                    "breakout_time": ts, "side": side,
                     "duration_h": w, "duration_bucket": bucket_for(w),
                     "entry": float(row.close), "upper": float(upper.loc[ts]),
                     "lower": float(lower.loc[ts]), "range_size": float(range_size.loc[ts]),
@@ -246,7 +248,8 @@ def evaluate_route(event: dict, future: pd.DataFrame, entry_time: pd.Timestamp,
             rec = dict(base)
             rec.update({"horizon_h": horizon, "mfe_r": mfe, "mae_r": mae,
                         "hit_1r": mfe >= 1, "hit_2r": mfe >= 2, "hit_3r": mfe >= 3,
-                        "stopped": stopped, "terminal_r": float(terminal-fee_r)})
+                        "stopped": stopped, "gross_terminal_r": float(terminal),
+                        "terminal_r": float(terminal-fee_r)})
             out.append(rec)
     return out
 
@@ -321,7 +324,133 @@ def feature_study(events: pd.DataFrame) -> pd.DataFrame:
     return pd.concat(rows, ignore_index=True) if rows else pd.DataFrame()
 
 
-def report(duration: pd.DataFrame, features: pd.DataFrame,
+POLICIES = ["BASELINE", "VOLUME", "BODY", "COMPRESSION", "VOLUME_BODY",
+            "VOLUME_COMPRESSION", "BODY_COMPRESSION", "TRIPLE"]
+COSTS_BPS = [6, 10, 15, 20, 25, 30]
+
+
+def policy_masks(frame: pd.DataFrame, q: dict[str, float]) -> dict[str, pd.Series]:
+    volume = frame.volume_ratio.between(q["vol40"], q["vol80"], inclusive="both")
+    body = frame.body_atr >= q["body60"]
+    compression = frame.bb_compression <= q["bb40"]
+    yes = pd.Series(True, index=frame.index)
+    return {"BASELINE": yes, "VOLUME": volume, "BODY": body,
+            "COMPRESSION": compression, "VOLUME_BODY": volume & body,
+            "VOLUME_COMPRESSION": volume & compression,
+            "BODY_COMPRESSION": body & compression,
+            "TRIPLE": volume & body & compression}
+
+
+def risk_metrics(frame: pd.DataFrame, cost_bps: float) -> dict:
+    if frame.empty:
+        return {"trades": 0}
+    x = frame.sort_values(["breakout_time", "symbol"]).copy()
+    x["net_r"] = x.gross_terminal_r - (cost_bps/10000.0)/x.risk_pct
+    r = x.net_r.to_numpy(float)
+    equity = np.cumsum(r)
+    peak = np.maximum.accumulate(np.r_[0.0, equity])[:-1]
+    drawdown = equity-peak
+    losses = r < 0
+    longest = run = 0
+    for loss in losses:
+        run = run+1 if loss else 0
+        longest = max(longest, run)
+    pos, neg = r[r > 0].sum(), -r[r < 0].sum()
+    return {"trades": len(x), "symbols": x.symbol.nunique(), "avg_net_r": r.mean(),
+            "median_net_r": float(np.median(r)), "win_rate": float((r > 0).mean()),
+            "profit_factor": float(pos/neg) if neg > 0 else np.nan,
+            "max_drawdown_r": float(drawdown.min(initial=0)),
+            "longest_loss_streak": longest, "stop_rate": float(x.stopped.mean()),
+            "hit_2r": float(x.hit_2r.mean()), "total_r": float(r.sum())}
+
+
+def cluster_bootstrap_ci(frame: pd.DataFrame, cost_bps: float = 20,
+                         iterations: int = 1000) -> tuple[float, float]:
+    if frame.empty:
+        return np.nan, np.nan
+    x = frame.copy()
+    x["cluster"] = x.breakout_time.dt.floor("4h")
+    x["net_r"] = x.gross_terminal_r - (cost_bps/10000.0)/x.risk_pct
+    clusters = x.groupby("cluster", observed=True).net_r.mean().to_numpy()
+    if len(clusters) < 20:
+        return np.nan, np.nan
+    rng = np.random.default_rng(260901)
+    means = np.empty(iterations)
+    for i in range(iterations):
+        means[i] = rng.choice(clusters, size=len(clusters), replace=True).mean()
+    return tuple(np.quantile(means, [.025, .975]))
+
+
+def walk_forward_validation(events: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """180d train / 90d test. Thresholds come only from prior CORE events."""
+    if events.empty:
+        empty = pd.DataFrame()
+        return empty, empty, empty, empty, empty
+    base = events[(events.duration_h == 48) & (events.entry_route == "DIRECT") &
+                  (events.stop_method == "fixed_2pct") & (events.horizon_h == 24)].copy()
+    base = base.sort_values("breakout_time")
+    start, finish = base.breakout_time.min(), base.breakout_time.max()
+    test_start = start + pd.Timedelta(days=180)
+    selected: list[pd.DataFrame] = []
+    thresholds: list[dict] = []
+    fold = 0
+    while test_start < finish:
+        fold += 1
+        train_start, test_end = test_start-pd.Timedelta(days=180), test_start+pd.Timedelta(days=90)
+        train = base[(base.universe == "CORE_1_50") &
+                     (base.breakout_time >= train_start) & (base.breakout_time < test_start)]
+        test = base[(base.breakout_time >= test_start) & (base.breakout_time < test_end)]
+        if len(train) >= 200 and len(test) > 0:
+            q = {"vol40": train.volume_ratio.quantile(.4), "vol80": train.volume_ratio.quantile(.8),
+                 "body60": train.body_atr.quantile(.6), "bb40": train.bb_compression.quantile(.4)}
+            thresholds.append({"fold": fold, "train_start": train_start, "test_start": test_start,
+                               "test_end": test_end, "train_events": len(train), **q})
+            for policy, mask in policy_masks(test, q).items():
+                chosen = test.loc[mask].copy()
+                chosen["fold"] = fold; chosen["policy"] = policy
+                selected.append(chosen)
+        test_start = test_end
+    chosen = pd.concat(selected, ignore_index=True) if selected else pd.DataFrame()
+    rows: list[dict] = []
+    if not chosen.empty:
+        for (fold, policy, universe), part in chosen.groupby(["fold", "policy", "universe"], observed=True):
+            for cost in COSTS_BPS:
+                rows.append({"fold": fold, "policy": policy, "universe": universe,
+                             "cost_bps": cost, **risk_metrics(part, cost)})
+    wf = pd.DataFrame(rows)
+
+    aggregate: list[dict] = []
+    stability: list[dict] = []
+    if not chosen.empty:
+        for (policy, universe), part in chosen.groupby(["policy", "universe"], observed=True):
+            for cost in COSTS_BPS:
+                aggregate.append({"policy": policy, "universe": universe, "cost_bps": cost,
+                                  **risk_metrics(part, cost)})
+            lo, hi = cluster_bootstrap_ci(part, 20)
+            stability.append({"policy": policy, "universe": universe,
+                              "cluster_ci95_low_20bps": lo, "cluster_ci95_high_20bps": hi,
+                              "positive_fold_rate_20bps": float((wf[(wf.policy == policy) &
+                                  (wf.universe == universe) & (wf.cost_bps == 20)].avg_net_r > 0).mean())})
+    return wf, pd.DataFrame(aggregate), pd.DataFrame(stability), pd.DataFrame(thresholds), chosen
+
+
+def selected_stability(events: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
+    if events.empty:
+        return pd.DataFrame(), pd.DataFrame()
+    x = events.copy()
+    x["quarter"] = x.breakout_time.dt.tz_localize(None).dt.to_period("Q").astype(str)
+    x["net_r_20bps"] = x.gross_terminal_r - (20/10000.0)/x.risk_pct
+    symbol = x.groupby(["policy", "universe", "symbol"], observed=True).agg(
+        trades=("symbol", "size"), avg_net_r=("net_r_20bps", "mean"),
+        total_r=("net_r_20bps", "sum")).reset_index()
+    quarter = x.groupby(["policy", "universe", "quarter"], observed=True).agg(
+        trades=("symbol", "size"), avg_net_r=("net_r_20bps", "mean"),
+        total_r=("net_r_20bps", "sum")).reset_index()
+    return symbol, quarter
+
+
+def report(duration: pd.DataFrame, features: pd.DataFrame, validation: pd.DataFrame,
+           validation_stability: pd.DataFrame, thresholds: pd.DataFrame,
            symbols: list[str], args: argparse.Namespace) -> str:
     lines = ["# 横盘—突破时长研究", "", f"标的数：{len(symbols)}；历史长度：{args.history_days}天。",
              f"往返成本假设：{args.fee_bps_roundtrip:.1f} bps。", "",
@@ -335,6 +464,16 @@ def report(duration: pd.DataFrame, features: pd.DataFrame,
     if not features.empty:
         lines += ["## 48小时直接突破、2%止损：质量特征分箱", "", "Q1–Q5边界只用IS计算，随后原样应用于OOS。", "",
                   "```csv", features.to_csv(index=False).strip(), "```", ""]
+    if not validation.empty:
+        core = validation[validation.cost_bps == 20]
+        lines += ["## 冻结策略：滚动样本外与外部币种验证（20 bps）", "",
+                  "```csv", core.to_csv(index=False).strip(), "```", ""]
+    if not validation_stability.empty:
+        lines += ["## 4小时事件簇Bootstrap与正窗口比例", "", "```csv",
+                  validation_stability.to_csv(index=False).strip(), "```", ""]
+    if not thresholds.empty:
+        lines += ["## 各滚动窗口实际阈值", "", "```csv",
+                  thresholds.to_csv(index=False).strip(), "```", ""]
     lines += ["## 判读原则", "", "- 至少保留100个独立事件后再比较时长组。",
               "- 优先看OOS的平均终值R、2R到达率、止损率和中位结果。",
               "- 若更长横盘只有绝对MFE上升、但MFE/R和净R没有改善，则不支持延长扫描门槛。"]
@@ -343,9 +482,10 @@ def report(duration: pd.DataFrame, features: pd.DataFrame,
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser()
-    p.add_argument("--symbols", type=int, default=50)
+    p.add_argument("--symbols", type=int, default=100)
     p.add_argument("--symbol-list", default="")
     p.add_argument("--history-days", type=int, default=730)
+    p.add_argument("--min-history-days", type=int, default=365)
     p.add_argument("--fee-bps-roundtrip", type=float, default=10.0)
     p.add_argument("--cache", default="data")
     p.add_argument("--output", default="results")
@@ -372,7 +512,10 @@ def main() -> None:
             else:
                 frames[interval] = api.klines(symbol, interval, int(start.timestamp()*1000), int(end.timestamp()*1000))
                 frames[interval].to_csv(fp, compression="gzip")
-        for ev in detect_events(frames["1h"], symbol):
+        if frames["1h"].empty or (frames["1h"].index.max()-frames["1h"].index.min()).days < args.min_history_days:
+            print(f"  skip: less than {args.min_history_days} days history", flush=True)
+            continue
+        for ev in detect_events(frames["1h"], symbol, i):
             all_rows.extend(evaluate_event(ev, frames["15m"], args.fee_bps_roundtrip))
     events = pd.DataFrame(all_rows)
     if not events.empty:
@@ -383,10 +526,19 @@ def main() -> None:
     duration = summarise(events, ["sample_period", "duration_h", "entry_route", "stop_method", "horizon_h"])
     stops = summarise(events, ["sample_period", "entry_route", "stop_method", "horizon_h"])
     features = feature_study(events)
+    wf, validation, validation_stability, thresholds, chosen = walk_forward_validation(events)
+    symbol_stability, quarter_stability = selected_stability(chosen)
     duration.to_csv(output / "duration_summary.csv", index=False)
     stops.to_csv(output / "stop_summary.csv", index=False)
     features.to_csv(output / "feature_summary.csv", index=False)
-    report_text = report(duration, features, symbols, args)
+    wf.to_csv(output / "walk_forward_folds.csv", index=False)
+    validation.to_csv(output / "policy_cost_validation.csv", index=False)
+    validation_stability.to_csv(output / "cluster_validation.csv", index=False)
+    thresholds.to_csv(output / "walk_forward_thresholds.csv", index=False)
+    symbol_stability.to_csv(output / "policy_symbol_stability.csv", index=False)
+    quarter_stability.to_csv(output / "policy_quarter_stability.csv", index=False)
+    report_text = report(duration, features, validation, validation_stability,
+                         thresholds, symbols, args)
     (output / "validation_report.md").write_text(report_text, encoding="utf-8")
     (output / "run_config.json").write_text(json.dumps(vars(args) | {"symbols_used": symbols}, indent=2), encoding="utf-8")
     print(f"Done: {len(events):,} evaluated paths -> {output}")
