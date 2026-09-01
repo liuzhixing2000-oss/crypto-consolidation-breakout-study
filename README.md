@@ -65,4 +65,4 @@ python breakout_study.py --symbols 100 --history-days 730 --min-history-days 365
 
 免费Yahoo 15分钟期货数据通常只有约60天，因此这一轮明确标记为探索性试验；任何候选参数都必须在更长的独立15分钟数据上再次验证。
 
-Railway 当前默认执行该贵金属15分钟多周期试验。
+Railway 当前默认执行 `precious_frozen_replication.py`，把上一轮的8小时横盘、15分钟回踩、2 ATR止损和8小时持有规则冻结后，在GC、SI、GLD、SLV及两年PAXGUSDT数据上做外部复现。

@@ -1,1 +1,1 @@
-worker: python precious_metals_multitimeframe.py
+worker: python precious_frozen_replication.py
