@@ -15,7 +15,7 @@
 
 ```bash
 python -m pip install -r requirements.txt
-python breakout_study.py --symbols 50 --history-days 730
+python breakout_study.py --symbols 100 --history-days 730 --min-history-days 365
 ```
 
 先用少量标的验证：
@@ -32,6 +32,12 @@ python breakout_study.py --symbol-list BTCUSDT,ETHUSDT,SOLUSDT --history-days 36
 - `duration_summary.csv`：按横盘时长分组的风险调整结果。
 - `stop_summary.csv`：不同止损逻辑的比较。
 - `feature_summary.csv`：48小时直接突破基线的压缩、突破质量与4H环境分箱。
+- `walk_forward_folds.csv`：180天训练、90天测试的逐窗口结果。
+- `policy_cost_validation.csv`：八个冻结策略在6–30 bps成本下的汇总。
+- `cluster_validation.csv`：按4小时市场事件簇计算的Bootstrap区间。
+- `walk_forward_thresholds.csv`：每个窗口仅由过去数据确定的实际阈值。
+- `policy_symbol_stability.csv`：币种贡献与稳定性。
+- `policy_quarter_stability.csv`：季度稳定性。
 - `validation_report.md`：自动生成的中文摘要。
 
 第一轮研究的目标不是直接选出交易参数，而是判断36–72小时、3–5天等时长组是否在样本外仍有更好的R期望。
@@ -41,7 +47,7 @@ python breakout_study.py --symbol-list BTCUSDT,ETHUSDT,SOLUSDT --history-days 36
 仓库已包含 `railway.json` 和 `Procfile`。连接仓库后默认启动命令为：
 
 ```bash
-python breakout_study.py --symbols 50 --history-days 730 --output results --cache data
+python breakout_study.py --symbols 100 --history-days 730 --min-history-days 365 --output results --cache data
 ```
 
 这是一次性研究任务，完成后正常退出，且不会循环执行或重复推送。
