@@ -449,8 +449,61 @@ def selected_stability(events: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame
     return symbol, quarter
 
 
+def candidate_robustness(events: pd.DataFrame, cost_bps: float = 20) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Stress-test the frozen VOLUME_COMPRESSION candidate without tuning it."""
+    if events.empty:
+        return pd.DataFrame(), pd.DataFrame()
+    x = events[events.policy == "VOLUME_COMPRESSION"].copy()
+    if x.empty:
+        return pd.DataFrame(), pd.DataFrame()
+    x["net_r"] = x.gross_terminal_r - (cost_bps/10000.0)/x.risk_pct
+    x["cluster"] = x.breakout_time.dt.floor("4h")
+    rows: list[dict] = []
+
+    def add(test: str, universe: str, part: pd.DataFrame) -> None:
+        if part.empty:
+            return
+        lo, hi = cluster_bootstrap_ci(part, cost_bps, 2000)
+        rows.append({"test": test, "universe": universe,
+                     **risk_metrics(part, cost_bps),
+                     "cluster_ci95_low": lo, "cluster_ci95_high": hi})
+
+    for universe, part in x.groupby("universe", observed=True):
+        add("ALL_SIGNALS", universe, part)
+        for side, side_part in part.groupby("side", observed=True):
+            add(f"SIDE_{side}", universe, side_part)
+
+        # A simultaneous market-wide move can trigger many correlated coins.
+        # Keep only the strongest pre-entry compression in each 4H cluster.
+        one = (part.sort_values(["cluster", "bb_compression", "symbol"])
+                   .drop_duplicates("cluster", keep="first"))
+        add("ONE_PER_4H_CLUSTER", universe, one)
+
+        # Diagnostic only: remove the largest realised contributors. This is
+        # deliberately not a trading rule; it reveals winner concentration.
+        contribution = part.groupby("symbol", observed=True).net_r.sum().sort_values(ascending=False)
+        for n in (1, 3, 5):
+            excluded = contribution.head(n).index
+            add(f"EXCLUDE_TOP_{n}_SYMBOLS", universe, part[~part.symbol.isin(excluded)])
+
+        symbol_means = part.groupby("symbol", observed=True).net_r.mean()
+        rows.append({"test": "EQUAL_WEIGHT_SYMBOLS", "universe": universe,
+                     "trades": len(part), "symbols": len(symbol_means),
+                     "avg_net_r": float(symbol_means.mean()),
+                     "median_net_r": float(symbol_means.median()),
+                     "win_rate": float((symbol_means > 0).mean())})
+
+    quarter = (x.assign(quarter=x.breakout_time.dt.tz_localize(None).dt.to_period("Q").astype(str))
+                 .groupby(["universe", "quarter"], observed=True)
+                 .agg(trades=("symbol", "size"), symbols=("symbol", "nunique"),
+                      avg_net_r=("net_r", "mean"), total_r=("net_r", "sum"))
+                 .reset_index())
+    return pd.DataFrame(rows), quarter
+
+
 def report(duration: pd.DataFrame, features: pd.DataFrame, validation: pd.DataFrame,
            validation_stability: pd.DataFrame, thresholds: pd.DataFrame,
+           robustness: pd.DataFrame, robustness_quarters: pd.DataFrame,
            symbols: list[str], args: argparse.Namespace) -> str:
     lines = ["# 横盘—突破时长研究", "", f"标的数：{len(symbols)}；历史长度：{args.history_days}天。",
              f"往返成本假设：{args.fee_bps_roundtrip:.1f} bps。", "",
@@ -474,6 +527,13 @@ def report(duration: pd.DataFrame, features: pd.DataFrame, validation: pd.DataFr
     if not thresholds.empty:
         lines += ["## 各滚动窗口实际阈值", "", "```csv",
                   thresholds.to_csv(index=False).strip(), "```", ""]
+    if not robustness.empty:
+        lines += ["## 冻结候选 VOLUME_COMPRESSION 压力测试（20 bps）", "",
+                  "SIDE、剔除头部贡献币和每4小时只取一个信号均为诊断，不用于重新择参。", "",
+                  "```csv", robustness.to_csv(index=False).strip(), "```", ""]
+    if not robustness_quarters.empty:
+        lines += ["## 冻结候选季度稳定性", "", "```csv",
+                  robustness_quarters.to_csv(index=False).strip(), "```", ""]
     lines += ["## 判读原则", "", "- 至少保留100个独立事件后再比较时长组。",
               "- 优先看OOS的平均终值R、2R到达率、止损率和中位结果。",
               "- 若更长横盘只有绝对MFE上升、但MFE/R和净R没有改善，则不支持延长扫描门槛。"]
@@ -528,6 +588,7 @@ def main() -> None:
     features = feature_study(events)
     wf, validation, validation_stability, thresholds, chosen = walk_forward_validation(events)
     symbol_stability, quarter_stability = selected_stability(chosen)
+    robustness, robustness_quarters = candidate_robustness(chosen)
     duration.to_csv(output / "duration_summary.csv", index=False)
     stops.to_csv(output / "stop_summary.csv", index=False)
     features.to_csv(output / "feature_summary.csv", index=False)
@@ -537,8 +598,10 @@ def main() -> None:
     thresholds.to_csv(output / "walk_forward_thresholds.csv", index=False)
     symbol_stability.to_csv(output / "policy_symbol_stability.csv", index=False)
     quarter_stability.to_csv(output / "policy_quarter_stability.csv", index=False)
+    robustness.to_csv(output / "candidate_robustness.csv", index=False)
+    robustness_quarters.to_csv(output / "candidate_quarter_stability.csv", index=False)
     report_text = report(duration, features, validation, validation_stability,
-                         thresholds, symbols, args)
+                         thresholds, robustness, robustness_quarters, symbols, args)
     (output / "validation_report.md").write_text(report_text, encoding="utf-8")
     (output / "run_config.json").write_text(json.dumps(vars(args) | {"symbols_used": symbols}, indent=2), encoding="utf-8")
     print(f"Done: {len(events):,} evaluated paths -> {output}")
