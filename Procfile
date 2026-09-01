@@ -1,1 +1,1 @@
-worker: python cross_asset_study.py
+worker: python precious_metals_multitimeframe.py

@@ -2,7 +2,7 @@
   "$schema": "https://railway.com/railway.schema.json",
   "build": {"builder": "NIXPACKS"},
   "deploy": {
-    "startCommand": "python cross_asset_study.py",
+    "startCommand": "python precious_metals_multitimeframe.py",
     "restartPolicyType": "NEVER"
   }
 }
